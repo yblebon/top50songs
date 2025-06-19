@@ -41,6 +41,16 @@
         th {
             background-color: #1a73e8;
             color: white;
+            cursor: pointer;
+            position: relative;
+        }
+        th.sortable:hover {
+            background-color: #1557b0;
+        }
+        th .sort-indicator {
+            display: inline-block;
+            margin-left: 5px;
+            font-size: 0.8em;
         }
         tr:hover {
             background-color: #f1f1f1;
@@ -103,11 +113,11 @@
         <table id="chart-table">
             <thead>
                 <tr>
-                    <th class="rank">Rank</th>
-                    <th class="song-title">Song Title</th>
-                    <th class="artist">Artist</th>
-                    <th class="weeks">Weeks on Chart</th>
-                    <th class="peak">Peak Position</th>
+                    <th class="sortable rank" data-key="this_week">Rank<span class="sort-indicator"></span></th>
+                    <th class="sortable song-title" data-key="song">Song Title<span class="sort-indicator"></span></th>
+                    <th class="sortable artist" data-key="artist">Artist<span class="sort-indicator"></span></th>
+                    <th class="sortable weeks" data-key="weeks_on_chart">Weeks on Chart<span class="sort-indicator"></span></th>
+                    <th class="sortable peak" data-key="peak_position">Peak Position<span class="sort-indicator"></span></th>
                     <th class="lyrics">Lyrics</th>
                 </tr>
             </thead>
@@ -123,6 +133,11 @@
     </footer>
 
     <script>
+        // Global variable to store chart data
+        let chartData = [];
+        let sortKey = 'this_week';
+        let sortDirection = 1; // 1 for ascending, -1 for descending
+
         // Function to format string for Genius URL
         function formatForGenius(str) {
             return str
@@ -163,6 +178,63 @@
             }
         }
 
+        // Function to render table
+        function renderTable(data) {
+            const tbody = document.getElementById('chart-body');
+            tbody.innerHTML = '';
+            data.slice(0, 50).forEach((song) => {
+                const lyricsUrl = getLyricsUrl(song.song, song.artist);
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td class="rank">${song.this_week}</td>
+                    <td class="song-title">${song.song}</td>
+                    <td class="artist">${song.artist}</td>
+                    <td class="weeks">${song.weeks_on_chart}</td>
+                    <td class="peak">${song.peak_position}</td>
+                    <td class="lyrics"><a href="${lyricsUrl}" target="_blank">View Lyrics</a></td>
+                `;
+                tbody.appendChild(row);
+            });
+        }
+
+        // Function to sort data
+        function sortData(key) {
+            if (sortKey === key) {
+                sortDirection *= -1; // Toggle direction
+            } else {
+                sortKey = key;
+                sortDirection = 1; // Default to ascending
+            }
+
+            chartData.sort((a, b) => {
+                let valueA = a[key];
+                let valueB = b[key];
+
+                // Convert to numbers for numeric fields
+                if (key === 'this_week' || key === 'weeks_on_chart' || key === 'peak_position') {
+                    valueA = parseInt(valueA, 10);
+                    valueB = parseInt(valueB, 10);
+                } else {
+                    // Convert strings to lowercase for case-insensitive sorting
+                    valueA = valueA.toLowerCase();
+                    valueB = valueB.toLowerCase();
+                }
+
+                if (valueA < valueB) return -1 * sortDirection;
+                if (valueA > valueB) return 1 * sortDirection;
+                return 0;
+            });
+
+            // Update sort indicators
+            document.querySelectorAll('.sort-indicator').forEach((indicator) => {
+                indicator.textContent = '';
+            });
+            const activeTh = document.querySelector(`th[data-key="${key}"] .sort-indicator`);
+            activeTh.textContent = sortDirection === 1 ? '▲' : '▼';
+
+            renderTable(chartData);
+        }
+
         async function fetchChartData() {
             const tbody = document.getElementById('chart-body');
             const errorMessage = document.getElementById('error-message');
@@ -190,27 +262,18 @@
                 // Update chart title with the date
                 chartTitle.textContent = `Top 50 US Songs - Weekly Chart (${chartDate})`;
 
-                // Clear existing table content
-                tbody.innerHTML = '';
-
                 // Ensure data exists and is an array
                 if (!chart.data || !Array.isArray(chart.data)) {
                     throw new Error('Invalid chart data format');
                 }
 
-                // Populate table with top 50 songs
-                chart.data.slice(0, 50).forEach((song, index) => {
-                    const lyricsUrl = getLyricsUrl(song.song, song.artist);
-                    const row = document.createElement('tr');
-                    row.innerHTML = `
-                        <td class="rank">${song.this_week}</td>
-                        <td class="song-title">${song.song}</td>
-                        <td class="artist">${song.artist}</td>
-                        <td class="weeks">${song.weeks_on_chart}</td>
-                        <td class="peak">${song.peak_position}</td>
-                        <td class="lyrics"><a href="${lyricsUrl}" target="_blank">View Lyrics</a></td>
-                    `;
-                    tbody.appendChild(row);
+                // Store data globally
+                chartData = chart.data;
+                renderTable(chartData);
+
+                // Add event listeners to sortable headers
+                document.querySelectorAll('.sortable').forEach((th) => {
+                    th.addEventListener('click', () => sortData(th.getAttribute('data-key')));
                 });
             } catch (error) {
                 console.error('Error fetching chart data:', error);
