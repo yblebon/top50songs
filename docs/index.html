@@ -266,6 +266,10 @@
     .col-duration { font-family: var(--font-mono); font-size: .78rem; color: var(--muted); text-align: center; width: 6rem; }
     .col-actions { width: 2.5rem; min-width: 2.5rem; text-align: center; padding: .5rem .4rem; }
 
+    /* ── HALL OF FAME COLUMNS ────────────────────────────── */
+    .col-died { font-family: var(--font-mono); font-size: .74rem; color: var(--muted); white-space: nowrap; width: 9rem; }
+    .col-cause { width: 18%; font-size: .82rem; color: var(--muted); }
+
     /* ── INLINE EDITING ──────────────────────────────────── */
     /* Cells that can be edited get a subtle hover affordance */
     .editable {
@@ -470,6 +474,7 @@
           <button class="tab-btn" data-mode="library" role="tab" aria-selected="false">
             My Library <span class="lib-badge" id="lib-badge" style="display:none">0</span>
           </button>
+          <button class="tab-btn" data-mode="fame" role="tab" aria-selected="false">Hall of Fame</button>
         </div>
         <div class="controls-right">
           <div class="import-wrap" id="import-wrap">
@@ -494,7 +499,7 @@
 
       <div class="table-wrap">
         <table id="chart-table" aria-label="Billboard Hot 100 weekly chart">
-          <caption>Billboard Hot 100 — weekly ranking of top US songs by streaming, airplay and sales</caption>
+          <caption id="table-caption">Billboard Hot 100 — weekly ranking of top US songs by streaming, airplay and sales</caption>
           <thead><tr></tr></thead>
           <tbody id="chart-body"></tbody>
         </table>
@@ -557,6 +562,10 @@
     const state = {
       data:             [],
       libData:          [],
+      fameData:         [],
+      fameLoaded:       false,
+      fameLoading:      false,
+      fameError:        null,
       mode:             'chart',
       prevMode:         'chart',
       sortKey:          'this_week',
@@ -565,8 +574,30 @@
       page:             1,
       searchQuery:      '',
       searchResults:    [],
-      selectedRows:     new Set(), // Set of strings `"mode:idx"` — works across chart and library
+      selectedRows:     new Set(), // Set of strings `"mode:idx"` — works across chart, library and fame
     };
+
+    // Per-tab caption/aria-label text (accessibility — announced to screen readers on tab switch)
+    const TABLE_CAPTIONS = {
+      chart:   'Billboard Hot 100 — weekly ranking of top US songs by streaming, airplay and sales',
+      library: 'Your personal music library',
+      fame:    'Hall of Fame — musicians and music industry figures who died in 2025',
+      search:  'Search results across Hot 100 and your library',
+    };
+    function updateTableCaption(mode) {
+      const text = TABLE_CAPTIONS[mode] || TABLE_CAPTIONS.chart;
+      const caption = $('table-caption');
+      if (caption) caption.textContent = text;
+      const table = $('chart-table');
+      if (table) table.setAttribute('aria-label', text);
+    }
+
+    // Minimal HTML-escaping helper for any dynamic string inserted via innerHTML
+    function escapeHTML(str) {
+      return String(str).replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+      }[c]));
+    }
 
     /* ── DOM ────────────────────────────────────────────── */
     const $ = id => document.getElementById(id);
@@ -667,11 +698,22 @@
         { key: null,   label: 'Lyrics',  cls: 'col-lyrics'  },
         { key: null,   label: 'YouTube', cls: 'col-youtube' },
       ],
+      fame: [
+        { key: null,          label: '',         cls: 'col-check',    check: true    },
+        { key: 'artist',      label: 'Name',     cls: 'col-song',     sortable: true },
+        { key: 'description', label: 'Known For', cls: 'col-artist',  sortable: true },
+        { key: null,          label: 'Died',     cls: 'col-died'                     },
+        { key: 'age',         label: 'Age',      cls: 'col-peak',     sortable: true },
+        { key: null,          label: 'Location', cls: 'col-album'                    },
+        { key: null,          label: 'Cause',    cls: 'col-cause'                    },
+        { key: null,          label: 'YouTube',  cls: 'col-youtube'                  },
+      ],
     };
 
     const NUMERIC_KEYS = {
       chart:   new Set(['this_week', 'weeks_on_chart', 'peak_position']),
       library: new Set(['id']),
+      fame:    new Set(['age', 'order']),
     };
 
     function renderHeaders() {
@@ -716,7 +758,7 @@
       state.mode    = mode;
       state.prevMode = mode;
       state.page    = 1;
-      state.sortKey = mode === 'chart' ? 'this_week' : 'id';
+      state.sortKey = mode === 'chart' ? 'this_week' : mode === 'fame' ? 'order' : 'id';
       state.sortDir = ASC;
 
       document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -726,17 +768,23 @@
       });
 
       $('import-wrap').classList.toggle('visible', mode === 'library');
+      updateTableCaption(mode);
 
       // Clear selection when switching tabs
       state.selectedRows.clear();
       updateSelectionBar();
+
+      // Lazily fetch Hall of Fame data the first time the tab is opened.
+      // This sets state.fameLoading synchronously, so the renderTable() call
+      // right below will correctly show the loading state.
+      if (mode === 'fame' && !state.fameLoaded && !state.fameLoading) fetchFameData();
 
       renderHeaders();
       renderTable();
 
       // Paint any previously-fetched thumbnails from session — no quota
       if (mode === 'library') loadCachedLibraryThumbnails();
-      else if (mode === 'chart') paintChartCachedThumbnails();
+      else if (mode === 'chart' || mode === 'fame') paintChartCachedThumbnails();
     }
 
     /* ── DATE HELPER ────────────────────────────────────── */
@@ -858,7 +906,8 @@
 
     async function fetchOneYtResult(song, artist, signal) {
       if (!YT_KEY) return null; // key not yet loaded or failed to load
-      const url = `${YT_SEARCH}?part=snippet&q=${encodeURIComponent(artist + ' - ' + song)}&type=video&maxResults=1&key=${YT_KEY}`;
+      const query = song ? `${artist} - ${song}` : artist;
+      const url = `${YT_SEARCH}?part=snippet&q=${encodeURIComponent(query)}&type=video&maxResults=1&key=${YT_KEY}`;
       // Use no-referrer-when-downgrade so the Referer header is sent when on HTTPS
       // (fully removing it with 'no-referrer' still gets blocked by Google's referrer checks)
       const res = await fetch(url, { signal, referrerPolicy: 'no-referrer-when-downgrade' });
@@ -988,6 +1037,7 @@
     /* ── PAGINATION ─────────────────────────────────────── */
     const activeData = () => state.mode === 'search' ? state.searchResults
                            : state.mode === 'library' ? state.libData
+                           : state.mode === 'fame'    ? state.fameData
                            : state.data;
     const totalPages = () => Math.ceil(activeData().length / PAGE_SIZE);
     const pageSlice  = () => { const d = activeData(); return d.slice((state.page - 1) * PAGE_SIZE, state.page * PAGE_SIZE); };
@@ -1073,7 +1123,14 @@
 
       const meta = $('search-meta');
       meta.classList.add('visible');
-      meta.innerHTML = `<strong>${state.searchResults.length}</strong> result${state.searchResults.length !== 1 ? 's' : ''} for "${query.trim()}"`;
+      meta.innerHTML = '';
+      const metaStrong = document.createElement('strong');
+      metaStrong.textContent = String(state.searchResults.length);
+      meta.appendChild(metaStrong);
+      meta.appendChild(document.createTextNode(
+        ` result${state.searchResults.length !== 1 ? 's' : ''} for "${query.trim()}"`
+      ));
+      updateTableCaption('search');
 
       renderHeaders();
       renderTable();
@@ -1085,6 +1142,39 @@
     function renderTable() {
       const slice = pageSlice();
       chartBody.innerHTML = '';
+
+      // Hall of Fame — loading / error state
+      if (state.mode === 'fame' && (state.fameLoading || state.fameError)) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td'); td.colSpan = 8;
+        td.innerHTML = state.fameLoading
+          ? `<div class="loading-wrap" style="padding:3rem 0">
+               <div class="spinner" aria-hidden="true"></div>
+               <p class="loading-label">Loading Hall of Fame…</p>
+             </div>`
+          : `<div class="lib-empty">
+               <p class="lib-empty-title">Couldn't load Hall of Fame</p>
+               <p class="lib-empty-sub">${escapeHTML(state.fameError || 'Please try again later.')}</p>
+             </div>`;
+        tr.appendChild(td); chartBody.appendChild(tr);
+        resultCount.textContent = '';
+        renderPagination();
+        return;
+      }
+
+      // Hall of Fame — loaded but empty
+      if (state.mode === 'fame' && state.fameLoaded && activeData().length === 0) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td'); td.colSpan = 8;
+        td.innerHTML = `<div class="lib-empty">
+          <p class="lib-empty-title">No entries</p>
+          <p class="lib-empty-sub">Nothing to show right now.</p>
+        </div>`;
+        tr.appendChild(td); chartBody.appendChild(tr);
+        resultCount.textContent = '0 entries';
+        renderPagination();
+        return;
+      }
 
       // Library empty state
       if (state.mode === 'library' && activeData().length === 0) {
@@ -1186,6 +1276,37 @@
           tdAl.appendChild(makeEditableSpan(libIdx, 'album', song.album)); tr.appendChild(tdAl);
           const tdD = document.createElement('td'); tdD.className = 'col-duration'; tdD.textContent = song.duration; tr.appendChild(tdD);
 
+        } else if (state.mode === 'fame') {
+          /* ── Hall of Fame columns ── */
+          const tdCk = document.createElement('td'); tdCk.className = 'col-check';
+          const cb   = document.createElement('input');
+          cb.type    = 'checkbox'; cb.className = 'row-cb';
+          const dataIdx = globalIdx;
+          cb.checked = state.selectedRows.has(selKey('fame', dataIdx));
+          cb.setAttribute('aria-label', `Select ${song.artist}`);
+          cb.addEventListener('change', () => toggleRowSelection('fame', dataIdx, cb.checked, tr));
+          tdCk.appendChild(cb); tr.appendChild(tdCk);
+          if (cb.checked) tr.classList.add('row-selected');
+
+          const tdN = document.createElement('td'); tdN.className = 'col-song';
+          if (song.wiki_url) {
+            const nameLink = document.createElement('a');
+            nameLink.href = song.wiki_url; nameLink.target = '_blank'; nameLink.rel = 'noopener noreferrer';
+            nameLink.className = 'song-title'; nameLink.style.color = 'inherit'; nameLink.style.textDecoration = 'none';
+            nameLink.textContent = song.artist;
+            tdN.appendChild(nameLink);
+          } else {
+            const spN = document.createElement('span'); spN.className = 'song-title'; spN.textContent = song.artist;
+            tdN.appendChild(spN);
+          }
+          tr.appendChild(tdN);
+
+          const tdDesc = document.createElement('td'); tdDesc.className = 'col-artist'; tdDesc.textContent = song.description || '—'; tr.appendChild(tdDesc);
+          const tdDied = document.createElement('td'); tdDied.className = 'col-died';  tdDied.textContent = song.dateDisplay || '—'; tr.appendChild(tdDied);
+          const tdAge  = document.createElement('td'); tdAge.className  = 'col-peak';  tdAge.textContent  = song.age || '—'; tr.appendChild(tdAge);
+          const tdLoc  = document.createElement('td'); tdLoc.className  = 'col-album'; tdLoc.textContent  = song.location || '—'; tr.appendChild(tdLoc);
+          const tdCause = document.createElement('td'); tdCause.className = 'col-cause'; tdCause.textContent = song.cause || '—'; tr.appendChild(tdCause);
+
         } else {
           /* ── Search result columns (song + artist highlighted, source badge) ── */
           const tdS = document.createElement('td'); tdS.className = 'col-song';
@@ -1205,13 +1326,15 @@
         }
 
         /* ── Shared: Lyrics + YouTube ── */
-        const tdL = document.createElement('td'); tdL.className = 'col-lyrics';
-        const lnk = document.createElement('a');
-        lnk.href = getLyricsUrl(song.song, song.artist);
-        lnk.target = '_blank'; lnk.rel = 'noopener noreferrer';
-        lnk.className = 'lyrics-link'; lnk.textContent = 'Lyrics';
-        lnk.setAttribute('aria-label', `View lyrics for ${song.song} by ${song.artist} on Genius`);
-        tdL.appendChild(lnk); tr.appendChild(tdL);
+        if (state.mode !== 'fame') {
+          const tdL = document.createElement('td'); tdL.className = 'col-lyrics';
+          const lnk = document.createElement('a');
+          lnk.href = getLyricsUrl(song.song, song.artist);
+          lnk.target = '_blank'; lnk.rel = 'noopener noreferrer';
+          lnk.className = 'lyrics-link'; lnk.textContent = 'Lyrics';
+          lnk.setAttribute('aria-label', `View lyrics for ${song.song} by ${song.artist} on Genius`);
+          tdL.appendChild(lnk); tr.appendChild(tdL);
+        }
 
         const tdY = document.createElement('td'); tdY.className = 'col-youtube'; tdY.setAttribute('data-yt-key', key);
         const sk  = document.createElement('div'); sk.className = 'yt-skeleton'; sk.setAttribute('aria-label', 'Loading YouTube thumbnail');
@@ -1235,7 +1358,7 @@
 
       const start = (state.page - 1) * PAGE_SIZE + 1;
       const end   = Math.min(state.page * PAGE_SIZE, activeData().length);
-      const label = state.mode === 'search' ? 'results' : 'tracks';
+      const label = state.mode === 'search' ? 'results' : state.mode === 'fame' ? 'entries' : 'tracks';
       resultCount.innerHTML = `Showing <strong>${start}–${end}</strong> of ${activeData().length} ${label}`;
 
       renderPagination();
@@ -1247,7 +1370,7 @@
 
       // Paint cached thumbnails with zero quota
       if (state.mode === 'library') loadCachedLibraryThumbnails();
-      else if (state.mode === 'chart') paintChartCachedThumbnails();
+      else if (state.mode === 'chart' || state.mode === 'fame') paintChartCachedThumbnails();
     }
 
     /* ── INLINE EDITING ─────────────────────────────────── */
@@ -1429,7 +1552,9 @@
       const needsSearch = [...state.selectedRows].filter(k => {
         const [mode, idxStr] = k.split(':');
         const idx  = parseInt(idxStr, 10);
-        const song = mode === 'chart' ? state.data[idx] : state.libData[idx];
+        const song = mode === 'chart' ? state.data[idx]
+                   : mode === 'library' ? state.libData[idx]
+                   : state.fameData[idx];
         if (!song) return false;
         const sk = songKey(song.song, song.artist);
         return !song.youtubeUrl && ytStore[sk] === undefined;
@@ -1563,7 +1688,9 @@
         .map(k => {
           const [mode, idxStr] = k.split(':');
           const idx  = parseInt(idxStr, 10);
-          const song = mode === 'chart' ? state.data[idx] : state.libData[idx];
+          const song = mode === 'chart' ? state.data[idx]
+                     : mode === 'library' ? state.libData[idx]
+                     : state.fameData[idx];
           if (!song) return null;
           const sk = songKey(song.song, song.artist);
           if (song.youtubeUrl || ytStore[sk] !== undefined) return null; // already resolved
@@ -1669,6 +1796,7 @@
 
     /* ── FETCH CHART DATA ───────────────────────────────── */
     const BASE = 'https://raw.githubusercontent.com/mhollingshead/billboard-hot-100/main';
+    const FAME_URL = 'https://raw.githubusercontent.com/yblebon/datasources/refs/heads/main/playlist.json';
 
     async function fetchValidDates() {
       const res = await fetch(`${BASE}/valid_dates.json`);
@@ -1723,6 +1851,46 @@
         errorText.textContent     = `Failed to load chart data: ${err.message}. Please try again later.`;
         errorWrap.classList.add('visible');
         chartDate.textContent     = 'Chart unavailable';
+      }
+    }
+
+    /* ── FETCH HALL OF FAME DATA ─────────────────────────── */
+    // Loaded lazily the first time the tab is opened, then cached in state.
+    async function fetchFameData() {
+      state.fameLoading = true;
+      state.fameError   = null;
+
+      try {
+        const res = await fetch(FAME_URL);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = await res.json();
+        if (!Array.isArray(json)) throw new Error('Unexpected data format');
+
+        state.fameData = json.map((item, i) => ({
+          song:        '',                              // no song title — search is by name only
+          artist:      item.name || 'Unknown',
+          description: item.description || '',
+          dateDisplay: item.date_raw || item.date || '',
+          age:         item.age || '',
+          location:    item.location || '',
+          cause:       item.cause || '',
+          year:        item.year || '',
+          wiki_url:    item.wiki_url || '',
+          youtubeUrl:  '',
+          order:       i + 1,                            // preserves original chronological order
+        }));
+        state.fameLoaded = true;
+      } catch (err) {
+        console.error('Hall of Fame fetch error:', err);
+        state.fameError  = err.message;
+        state.fameLoaded = false;
+      } finally {
+        state.fameLoading = false;
+        if (state.mode === 'fame') {
+          state.page = 1;
+          renderTable();
+          paintChartCachedThumbnails(); // paint anything already resolved this session
+        }
       }
     }
 
